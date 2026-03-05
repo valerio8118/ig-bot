@@ -1,7 +1,7 @@
 """
 Instagram Preview Bot per Telegram
 ====================================
-Manda @username → ricevi gli ultimi 5 post + tutte le stories attive.
+Manda @username → scegli quanti post e stories estrarre.
 
 Requisiti:
     pip install python-telegram-bot instaloader pillow
@@ -26,17 +26,8 @@ BOT_TOKEN    = os.environ.get("BOT_TOKEN",    "")
 IG_USERNAME  = os.environ.get("IG_USERNAME",  "")
 IG_SESSIONID = os.environ.get("IG_SESSIONID", "")
 
-# Cartella dove salvare i file scaricati
-DOWNLOAD_DIR = os.path.expanduser("~/Downloads/IgBot")
-
-# Quanti post recenti mostrare
-MAX_POSTS    = 5
-
-# Ritardo tra richieste Instagram (secondi) — evita rate-limit
+DOWNLOAD_DIR  = os.path.expanduser("~/Downloads/IgBot")
 REQUEST_DELAY = 2.0
-
-# ID Telegram degli utenti autorizzati (lascia vuoto [] per permettere a tutti)
-# Es: ALLOWED_USERS = [123456789, 987654321]
 ALLOWED_USERS = []
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -75,7 +66,7 @@ except ImportError:
     PIL_OK = False
 
 
-# ─── Errori che indicano davvero un blocco/autenticazione ─────────────────────
+# ─── Errori di blocco/autenticazione ──────────────────────────────────────────
 _BLOCK_KEYWORDS = ("login_required", "checkpoint_required", "challenge_required",
                    "Forbidden", "Not authorized", "LoginRequired",
                    "ProfileAccessDeniedException", "PrivateProfileNotFollowedException")
@@ -89,7 +80,6 @@ def _is_block_error(msg: str) -> bool:
 _loader: "instaloader.Instaloader | None" = None
 
 def _reset_loader():
-    """Force a fresh loader on next call (e.g. after session expiry)."""
     global _loader
     _loader = None
 
@@ -111,7 +101,6 @@ def _get_loader() -> "instaloader.Instaloader":
         max_connection_attempts=3,
     )
 
-    # Try session file first
     script_dir   = os.path.dirname(os.path.abspath(__file__))
     session_file = os.path.join(script_dir, f"ig_session_{IG_USERNAME}")
     if os.path.exists(session_file):
@@ -129,7 +118,6 @@ def _get_loader() -> "instaloader.Instaloader":
             except Exception:
                 pass
 
-    # Inject sessionid
     sid = IG_SESSIONID.strip()
     if sid:
         L.context._session.cookies.set("sessionid", sid, domain=".instagram.com")
@@ -155,9 +143,6 @@ def _get_loader() -> "instaloader.Instaloader":
                 pass
         else:
             log.warning("⚠️ sessionid non valido — accesso anonimo")
-            # Reset so next call retries auth instead of reusing broken loader
-            _loader = L
-            return L
 
     _loader = L
     return L
@@ -165,18 +150,13 @@ def _get_loader() -> "instaloader.Instaloader":
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
-# FIX: usa gli stessi cookie/header della sessione Instagram per scaricare
-# i media dalla CDN (scontent-*.cdninstagram.com), che blocca User-Agent generici.
 def _fetch_bytes(url: str, loader: "instaloader.Instaloader | None" = None) -> "bytes | None":
-    """Download raw bytes from a URL, optionally reusing the Instagram session."""
     try:
         if loader is not None and loader.context.is_logged_in:
-            # Usa la sessione requests di instaloader (già autenticata + cookie)
             resp = loader.context._session.get(str(url), timeout=15, stream=False)
             resp.raise_for_status()
             return resp.content
         else:
-            # Fallback senza sessione (per URL pubblici)
             req = urllib.request.Request(
                 str(url),
                 headers={
@@ -196,7 +176,6 @@ def _fetch_bytes(url: str, loader: "instaloader.Instaloader | None" = None) -> "
 
 
 def _thumb_bytes(raw: bytes, size: int = 800) -> bytes:
-    """Resize image bytes to max `size` px on longest side."""
     if not PIL_OK:
         return raw
     try:
@@ -214,7 +193,6 @@ def _is_allowed(user_id: int) -> bool:
 
 
 def _fmt_caption(post) -> str:
-    """Build a caption string for a post."""
     date = post.date_utc.strftime("%d/%m/%Y")
     kind = "🎬 Reel" if (post.typename == "GraphReel" or
                          getattr(post, "product_type", "") == "clips") else \
@@ -230,14 +208,41 @@ def _fmt_caption(post) -> str:
     return text
 
 
+# ─── Keyboard builders ────────────────────────────────────────────────────────
+
+def _kb_posts(username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("0 post",  callback_data=f"posts|0|{username}"),
+            InlineKeyboardButton("3 post",  callback_data=f"posts|3|{username}"),
+            InlineKeyboardButton("5 post",  callback_data=f"posts|5|{username}"),
+        ],
+        [
+            InlineKeyboardButton("10 post", callback_data=f"posts|10|{username}"),
+            InlineKeyboardButton("20 post", callback_data=f"posts|20|{username}"),
+        ],
+    ])
+
+def _kb_stories(username: str, n_posts: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("0 stories",  callback_data=f"stories|0|{username}|{n_posts}"),
+            InlineKeyboardButton("3 stories",  callback_data=f"stories|3|{username}|{n_posts}"),
+            InlineKeyboardButton("5 stories",  callback_data=f"stories|5|{username}|{n_posts}"),
+        ],
+        [
+            InlineKeyboardButton("10 stories", callback_data=f"stories|10|{username}|{n_posts}"),
+            InlineKeyboardButton("Tutte ✅",   callback_data=f"stories|99|{username}|{n_posts}"),
+        ],
+    ])
+
+
 # ─── Bot handlers ─────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Ciao! Sono il tuo bot Instagram.\n\n"
-        "Mandami un username (con o senza @) e ti mostro:\n"
-        "• 📷 Ultimi 5 post\n"
-        "• 📖 Tutte le stories attive\n\n"
+        "Mandami uno username Instagram (con o senza @) e ti guido passo passo.\n\n"
         "Es:  <code>aniram</code>  oppure  <code>@aniram</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -249,43 +254,81 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/start — messaggio di benvenuto\n"
         "/help  — questo messaggio\n\n"
         "<b>Uso:</b>\n"
-        "Manda direttamente il nome utente Instagram (senza slash).\n"
+        "Manda uno username Instagram → scegli quanti post e stories estrarre.\n"
         "Es: <code>cristina_rossi</code>",
         parse_mode=ParseMode.HTML,
     )
 
 
 async def handle_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Main handler: receives a username and sends posts + stories."""
+    """Step 1 — riceve lo username, chiede quanti post."""
     if not _is_allowed(update.effective_user.id):
         await update.message.reply_text("⛔ Non sei autorizzato.")
         return
 
-    raw = update.message.text.strip().lstrip("@")
-    if not raw or " " in raw:
+    username = update.message.text.strip().lstrip("@")
+    if not username or " " in username:
         await update.message.reply_text(
             "Mandami solo uno username Instagram, es: <code>aniram</code>",
             parse_mode=ParseMode.HTML)
         return
 
-    await update.message.chat.send_action(ChatAction.TYPING)
-    msg = await update.message.reply_text(f"🔍 Cerco <b>@{raw}</b>…", parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        f"📷 Quanti <b>post</b> vuoi estrarre da <b>@{username}</b>?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_kb_posts(username),
+    )
 
-    # Run the blocking Instagram fetch in executor
+
+async def handle_posts_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 2 — riceve la scelta dei post, chiede quante stories."""
+    query = update.callback_query
+    await query.answer()
+
+    _, n_posts_str, username = query.data.split("|", 2)
+    n_posts = int(n_posts_str)
+
+    await query.edit_message_text(
+        f"📖 Quante <b>stories</b> vuoi estrarre da <b>@{username}</b>?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_kb_stories(username, n_posts),
+    )
+
+
+async def handle_stories_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Step 3 — riceve la scelta delle stories e avvia il fetch."""
+    query = update.callback_query
+    await query.answer()
+
+    _, n_stories_str, username, n_posts_str = query.data.split("|", 3)
+    n_posts   = int(n_posts_str)
+    n_stories = int(n_stories_str)
+
+    stories_label = "tutte" if n_stories == 99 else str(n_stories)
+    await query.edit_message_text(
+        f"🔍 Cerco <b>@{username}</b>…\n"
+        f"Post: <b>{n_posts}</b>  ·  Stories: <b>{stories_label}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    await query.message.chat.send_action(ChatAction.TYPING)
+
     loop = asyncio.get_event_loop()
     try:
-        result = await loop.run_in_executor(None, _fetch_ig_data, raw)
+        result = await loop.run_in_executor(
+            None, _fetch_ig_data, username, n_posts, n_stories
+        )
     except Exception as e:
-        await msg.edit_text(f"❌ Errore: {e}")
+        await query.edit_message_text(f"❌ Errore: {e}")
         return
 
     if "error" in result:
-        await msg.edit_text(f"❌ {result['error']}")
+        await query.edit_message_text(f"❌ {result['error']}")
         return
 
-    profile  = result["profile"]
-    posts    = result["posts"]
-    stories  = result["stories"]
+    profile = result["profile"]
+    posts   = result["posts"]
+    stories = result["stories"]
 
     # ── Profile header ────────────────────────────────────────────────────────
     priv = "🔒 " if profile["is_private"] else ""
@@ -297,114 +340,112 @@ async def handle_username(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if profile["bio"]:
         header += f"\n{profile['bio'][:180]}"
 
-    await msg.delete()   # remove the "🔍 Cerco..." message
+    await query.delete_message()
 
     pic_bytes = _fetch_bytes(profile["pic_url"], result.get("loader")) if profile.get("pic_url") else None
     if pic_bytes:
         try:
-            await update.message.reply_photo(
+            await query.message.reply_photo(
                 photo=io.BytesIO(_thumb_bytes(pic_bytes, size=600)),
                 caption=header,
                 parse_mode=ParseMode.HTML,
             )
         except Exception:
-            await update.message.reply_text(header, parse_mode=ParseMode.HTML)
+            await query.message.reply_text(header, parse_mode=ParseMode.HTML)
     else:
-        await update.message.reply_text(header, parse_mode=ParseMode.HTML)
+        await query.message.reply_text(header, parse_mode=ParseMode.HTML)
 
     # ── Posts ─────────────────────────────────────────────────────────────────
     if posts:
-        await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
-        await update.message.reply_text(
+        await query.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+        await query.message.reply_text(
             f"📷 <b>Ultimi {len(posts)} post:</b>", parse_mode=ParseMode.HTML)
 
         for p in posts:
-            caption = _fmt_caption(p["post"])
+            caption   = _fmt_caption(p["post"])
             raw_bytes = p.get("bytes")
             if not raw_bytes:
-                await update.message.reply_text(f"⚠️ Post non disponibile\n{caption}")
+                await query.message.reply_text(f"⚠️ Post non disponibile\n{caption}")
                 continue
             try:
                 if p["is_video"]:
-                    await update.message.reply_video(
+                    await query.message.reply_video(
                         video=io.BytesIO(raw_bytes),
                         caption=caption,
                         supports_streaming=True,
                     )
                 else:
-                    await update.message.reply_photo(
+                    await query.message.reply_photo(
                         photo=io.BytesIO(_thumb_bytes(raw_bytes)),
                         caption=caption,
                     )
             except Exception as e:
                 log.warning(f"Send post failed: {e}")
-                await update.message.reply_text(f"⚠️ Impossibile inviare questo media\n{caption}")
+                await query.message.reply_text(f"⚠️ Impossibile inviare questo media\n{caption}")
             await asyncio.sleep(0.5)
-    else:
+    elif n_posts > 0:
         err = result.get("posts_error")
         if err == "private":
-            await update.message.reply_text("📷 Profilo privato — post non accessibili.")
+            await query.message.reply_text("📷 Profilo privato — post non accessibili.")
         elif err == "blocked":
-            await update.message.reply_text("📷 Post non accessibili (profilo bloccato o privato).")
+            await query.message.reply_text("📷 Post non accessibili (profilo bloccato o privato).")
         else:
-            await update.message.reply_text("📷 Nessun post recente trovato.")
+            await query.message.reply_text("📷 Nessun post recente trovato.")
 
     # ── Stories ───────────────────────────────────────────────────────────────
     if stories:
-        await update.message.reply_text(
+        await query.message.reply_text(
             f"📖 <b>{len(stories)} stories attive:</b>", parse_mode=ParseMode.HTML)
-        await update.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
+        await query.message.chat.send_action(ChatAction.UPLOAD_PHOTO)
 
         for s in stories:
-            date_str = s["date"].strftime("%d/%m/%Y %H:%M")
-            caption  = f"📖 Story  ·  {date_str}"
+            date_str  = s["date"].strftime("%d/%m/%Y %H:%M")
+            caption   = f"📖 Story  ·  {date_str}"
             raw_bytes = s.get("bytes")
             if not raw_bytes:
-                await update.message.reply_text(f"⚠️ Story non disponibile · {date_str}")
+                await query.message.reply_text(f"⚠️ Story non disponibile · {date_str}")
                 continue
             try:
                 if s["is_video"]:
-                    await update.message.reply_video(
+                    await query.message.reply_video(
                         video=io.BytesIO(raw_bytes),
                         caption=caption,
                         supports_streaming=True,
                     )
                 else:
-                    await update.message.reply_photo(
+                    await query.message.reply_photo(
                         photo=io.BytesIO(_thumb_bytes(raw_bytes)),
                         caption=caption,
                     )
             except Exception as e:
                 log.warning(f"Send story failed: {e}")
-                await update.message.reply_text(f"⚠️ Impossibile inviare questa story · {date_str}")
+                await query.message.reply_text(f"⚠️ Impossibile inviare questa story · {date_str}")
             await asyncio.sleep(0.5)
-    else:
+    elif n_stories > 0:
         err = result.get("stories_error")
         if err == "no_login":
-            await update.message.reply_text("📖 Stories non disponibili (accesso anonimo).")
+            await query.message.reply_text("📖 Stories non disponibili (accesso anonimo).")
         elif err == "fetch_error":
-            await update.message.reply_text("📖 Errore nel recupero delle stories.")
+            await query.message.reply_text("📖 Errore nel recupero delle stories.")
         else:
-            await update.message.reply_text("📖 Nessuna storia pubblicata di recente.")
+            await query.message.reply_text("📖 Nessuna storia pubblicata di recente.")
 
-    # Note if we fell back to anonymous
-    used_anon = result.get("profile", {}).get("used_anon", False)
+    used_anon = profile.get("used_anon", False)
     anon_note = "\n<i>ℹ️ Profilo caricato in modalità pubblica (sei bloccato o account privato)</i>" if used_anon else ""
 
-    await update.message.reply_text(
+    await query.message.reply_text(
         f"✅ <b>@{profile['username']}</b> — fatto!{anon_note}",
         parse_mode=ParseMode.HTML)
 
 
 # ─── Blocking Instagram fetch (runs in executor) ──────────────────────────────
 
-def _fetch_ig_data(username: str) -> dict:
+def _fetch_ig_data(username: str, max_posts: int, max_stories: int) -> dict:
     L = _get_loader()
 
-    # ── Load profile ──────────────────────────────────────────────────────────
-    profile      = None
-    used_anon    = False   # True if we had to fall back to anonymous access
-    active_loader = L      # loader actually used (may switch to anon)
+    profile       = None
+    used_anon     = False
+    active_loader = L
 
     log.info(f"Loading profile @{username}, logged_in={L.context.is_logged_in}")
     try:
@@ -415,34 +456,29 @@ def _fetch_ig_data(username: str) -> dict:
     except Exception as e:
         err_msg = str(e)
         log.warning(f"Profile load error: {err_msg[:100]}")
-
-        # FIX: fallback anonimo SOLO per veri errori di blocco/autenticazione,
-        # non per qualsiasi errore che contenga "400" (es. nei log/URL)
         if _is_block_error(err_msg):
-            log.info(f"Accesso negato ({err_msg[:60]}) — riprovo anonimamente")
+            log.info("Accesso negato — riprovo anonimamente")
             try:
-                anon = instaloader.Instaloader(quiet=True, sleep=True, request_timeout=20)
-                profile      = instaloader.Profile.from_username(anon.context, username)
+                anon          = instaloader.Instaloader(quiet=True, sleep=True, request_timeout=20)
+                profile       = instaloader.Profile.from_username(anon.context, username)
                 active_loader = anon
-                used_anon    = True
+                used_anon     = True
             except instaloader.exceptions.ProfileNotExistsException:
                 return {"error": f"Profilo @{username} non trovato su Instagram."}
             except Exception as e2:
                 return {"error": f"Impossibile caricare @{username}: {e2}"}
         else:
-            # Errore generico (timeout, network) → resetta loader per prossima call
             _reset_loader()
             return {"error": f"Errore di rete: {err_msg}"}
 
-    # Get profile pic — FIX: passa il loader per usare la sessione autenticata
+    # Profile pic
     pic_url = ""
     try:
         pic_url = str(profile.profile_pic_url)
-        log.info(f"Profile pic URL obtained: {pic_url[:60]}…")
+        log.info(f"Profile pic URL: {pic_url[:60]}…")
     except Exception as e:
         log.warning(f"profile_pic_url failed: {e}")
 
-    # Fallback via web API pubblica
     if not pic_url:
         try:
             import json as _json
@@ -472,12 +508,14 @@ def _fetch_ig_data(username: str) -> dict:
     posts_data  = []
     posts_error = None
 
-    if profile.is_private and not active_loader.context.is_logged_in:
+    if max_posts == 0:
+        pass
+    elif profile.is_private and not active_loader.context.is_logged_in:
         posts_error = "private"
     else:
         try:
             for post in profile.get_posts():
-                if len(posts_data) >= MAX_POSTS:
+                if len(posts_data) >= max_posts:
                     break
                 url = post.video_url if post.is_video else post.url
                 raw = _fetch_bytes(url, active_loader)
@@ -491,14 +529,13 @@ def _fetch_ig_data(username: str) -> dict:
             err = str(e)
             log.warning(f"Posts fetch error: {err}")
             if not posts_data:
-                # FIX: fallback anonimo solo per veri blocchi, non errori generici
                 if not used_anon and _is_block_error(err):
                     log.info("Post fetch bloccato — riprovo anonimamente")
                     try:
-                        anon = instaloader.Instaloader(quiet=True, sleep=True, request_timeout=20)
+                        anon  = instaloader.Instaloader(quiet=True, sleep=True, request_timeout=20)
                         prof2 = instaloader.Profile.from_username(anon.context, username)
                         for post in prof2.get_posts():
-                            if len(posts_data) >= MAX_POSTS:
+                            if len(posts_data) >= max_posts:
                                 break
                             url = post.video_url if post.is_video else post.url
                             raw = _fetch_bytes(url, anon)
@@ -519,12 +556,17 @@ def _fetch_ig_data(username: str) -> dict:
     stories_data  = []
     stories_error = None
 
-    if not active_loader.context.is_logged_in:
+    if max_stories == 0:
+        pass
+    elif not active_loader.context.is_logged_in:
         stories_error = "no_login"
     else:
         try:
+            count = 0
             for story_batch in active_loader.get_stories(userids=[profile.userid]):
                 for item in story_batch.get_items():
+                    if max_stories != 99 and count >= max_stories:
+                        break
                     url = item.video_url if item.is_video else item.url
                     raw = _fetch_bytes(url, active_loader)
                     stories_data.append({
@@ -532,6 +574,7 @@ def _fetch_ig_data(username: str) -> dict:
                         "is_video": item.is_video,
                         "bytes":    raw,
                     })
+                    count += 1
                     time.sleep(REQUEST_DELAY)
         except Exception as e:
             log.warning(f"Stories fetch error: {e}")
@@ -539,7 +582,7 @@ def _fetch_ig_data(username: str) -> dict:
 
     return {
         "profile":       prof_info,
-        "loader":        active_loader,   # passato al handler per fetch foto profilo
+        "loader":        active_loader,
         "posts":         posts_data,
         "posts_error":   posts_error,
         "stories":       stories_data,
@@ -557,11 +600,8 @@ def main():
 
     if not BOT_TOKEN:
         print("\n❌ BOT_TOKEN non configurato!")
-        print("   1. Parla con @BotFather su Telegram → /newbot")
-        print("   2. Copia il token e incollalo in BOT_TOKEN nello script")
         return
 
-    # Pre-authenticate Instagram at startup
     log.info("🔐 Autenticazione Instagram...")
     try:
         _get_loader()
@@ -573,8 +613,9 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_help))
-    app.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, handle_username))
+    app.add_handler(CallbackQueryHandler(handle_posts_choice,   pattern=r"^posts\|"))
+    app.add_handler(CallbackQueryHandler(handle_stories_choice, pattern=r"^stories\|"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_username))
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
